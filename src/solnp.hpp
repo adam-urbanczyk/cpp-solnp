@@ -7,12 +7,8 @@
 #include "utils.hpp"
 #include "subnp.hpp"
 
-#define CHOL_WHOLE
-#define QR
-
 /* This is an interior method QP solver. */
 namespace cppsolnp {
-
 
     template<
             typename functor_model,
@@ -22,25 +18,22 @@ namespace cppsolnp {
             functor_model functor,
             parameter_input &parameter_data,
             const inequality_constraint_vectors &inequality_constraint_data,
-            const cppsolnp::log_list_ptr &event_log = nullptr,
+            dlib::matrix<double> &hessian_matrix,
             // Optional input
-/*		std::unique_ptr<dlib::matrix<double>> inequality_constraints = nullptr,
-		std::unique_ptr<dlib::matrix<double>> hessian_matrix = nullptr,
-		*/
-            // Below are control variables.
+            const cppsolnp::log_list_ptr &event_log = nullptr,
             double rho = 1.0, //penalty parameter
-            int maximum_major_iterations = 10,
-            int maximum_minor_iterations = 10,
-            const double &delta = 1e-5, // Step size in forward difference evaluation
-            const double &tolerance = 1e-4
+            int maximum_major_iterations = 400,
+            int maximum_minor_iterations = 800,
+            const double &delta = 1e-7, // Step size in forward difference evaluation
+            const double &tolerance = 1e-8
     ) {
         COMPILE_TIME_ASSERT(dlib::is_matrix<parameter_input>::value);
         COMPILE_TIME_ASSERT(dlib::is_matrix<inequality_constraint_vectors>::value);
-        COMPILE_TIME_ASSERT(parameter_input::NC <= 3 && parameter_input::NC > 0);
+        COMPILE_TIME_ASSERT(parameter_input::NC <= 3 && parameter_input::NC >= 0);
         COMPILE_TIME_ASSERT(inequality_constraint_vectors::NC <= 3);
 
         if (!isfinite(tolerance * tolerance)) {
-            throw std::runtime_error("Tolerance set too low.");
+            throw std::invalid_argument("Tolerance set too low.");
         }
 
         /* Split the parameter from the
@@ -49,8 +42,8 @@ namespace cppsolnp {
         dlib::matrix<double> parameter_bounds;
         dlib::matrix<double> objective_function_gradient;
 
-        int number_of_parameters = parameter_input::NR,
-                parameter_vector_width = parameter_input::NC;
+        auto number_of_parameters = parameter_data.nr(),
+                parameter_vector_width = parameter_data.nc();
 
         std::pair<bool, bool> lagrangian_parameters_bounded;
         lagrangian_parameters_bounded.first = true;
@@ -68,16 +61,16 @@ namespace cppsolnp {
             parameter_bounds = dlib::colm(parameter_data, dlib::range(1, 2));
 
         } else {
-            throw std::runtime_error("Error: Parameter array must have three columns or less.");
+            throw std::invalid_argument("Parameter array must have three columns or less.");
         }
 
         if (lagrangian_parameters_bounded.first) {
             if (dlib::min(dlib::colm(parameter_data, 2) - dlib::colm(parameter_data, 1)) <= 0) {
-                throw std::runtime_error(
-                        "Error: The lower bounds of the parameter constraints must be strictly less than the upper bounds.");
+                throw std::invalid_argument(
+                        "The lower bounds of the parameter constraints must be strictly less than the upper bounds.");
             } else if (dlib::min(parameters - dlib::colm(parameter_data, 1)) <= 0 ||
                        dlib::min(dlib::colm(parameter_data, 2) - parameters) <= 0) {
-                throw std::runtime_error("Error: Initial parameter values must be within the bounds.");
+                throw std::invalid_argument("Initial parameter values must be within the bounds.");
             }
         }
         /* Assume inequality constraints exist for now.
@@ -85,8 +78,8 @@ namespace cppsolnp {
         Lots of possibilities, little time.*/
 
 
-        int inequality_constraints_vector_length = inequality_constraint_vectors::NR,
-                inequality_constraints_vector_width = inequality_constraint_vectors::NC;
+        int inequality_constraints_vector_length = inequality_constraint_data.nr(),
+                inequality_constraints_vector_width = inequality_constraint_data.nc();
 
         int number_of_inequality_constraints;
 
@@ -106,14 +99,14 @@ namespace cppsolnp {
 
                 if (dlib::min(temporary_inequality_guess - dlib::colm(temporary_inequality_constraints, 0)) <= 0 ||
                     dlib::min(dlib::colm(temporary_inequality_constraints, 1) - temporary_inequality_guess) <= 0) {
-                    throw std::runtime_error("Error: Initial inequalities must be within bounds.");
+                    throw std::invalid_argument("Initial inequalities must be within bounds.");
                 }
 
             } else if (inequality_constraints_vector_width == 2) {
                 if (dlib::min(dlib::colm(inequality_constraint_data, 1) - dlib::colm(inequality_constraint_data, 0)) <=
                     0) {
-                    throw std::runtime_error(
-                            "Error: The lower bounds of the inequality constraints must be strictly less than the upper bounds.");
+                    throw std::invalid_argument(
+                            "The lower bounds of the inequality constraints must be strictly less than the upper bounds.");
                 }
                 temporary_inequality_guess =
                         0.5 * (dlib::colm(inequality_constraint_data, 0) + dlib::colm(inequality_constraint_data, 1));
@@ -121,10 +114,10 @@ namespace cppsolnp {
             } else if (inequality_constraints_vector_width == 1) {
                 number_of_inequality_constraints = 0;
             } else {
-                throw std::runtime_error("Error: Inequality constraints must have 2 or 3 columns.");
+                throw std::invalid_argument("Inequality constraints must have 2 or 3 columns.");
             }
             if (number_of_inequality_constraints > 0) {
-                if (lagrangian_parameters_bounded.first == true) {
+                if (lagrangian_parameters_bounded.first) {
                     // parameter_bounds = [parameter_bounds; temporary_inequality_constraints]
                     parameter_bounds = dlib::join_cols(temporary_inequality_constraints, parameter_bounds);
 
@@ -132,48 +125,43 @@ namespace cppsolnp {
                     parameter_bounds = temporary_inequality_constraints;
                 }
                 parameters = dlib::join_cols(temporary_inequality_guess, parameters);
-                //stack_matrix_on_bottom(temporary_inequality_guess, parameters);
             }
         }
 
         // Here we could release the temporary matrixes.
+        if (hessian_matrix.nr() != number_of_parameters + number_of_inequality_constraints ||
+            hessian_matrix.nc() != number_of_parameters + number_of_inequality_constraints) {
+            throw std::invalid_argument("The provided hessian matrix override was of invalid dimension.");
+        }
 
-        if (lagrangian_parameters_bounded.first == true || number_of_inequality_constraints > 0) {
+        if (lagrangian_parameters_bounded.first || number_of_inequality_constraints > 0) {
             lagrangian_parameters_bounded.second = true;
         }
-        // opd=[1 10 10 1.0e-5 1.0e-4];  % default optimization parameters
-
-        // Cost function, note that
-        // parameters = [inequality_guess;parameters]
 
         dlib::matrix<double> cost_vector;
         cost_vector = functor(dlib::rowm(parameters, dlib::range(number_of_inequality_constraints,
                                                                  number_of_inequality_constraints +
                                                                  number_of_parameters - 1))); // ob
-        event_log->push_back("Updated parameters: " +
-                             to_string(dlib::rowm(parameters, dlib::range(number_of_inequality_constraints,
-                                                                          number_of_inequality_constraints +
-                                                                          number_of_parameters - 1)),
-                                       true));
+
+        if (event_log)
+            event_log->push_back("Updated parameters: " +
+                                 to_string(dlib::rowm(parameters, dlib::range(number_of_inequality_constraints,
+                                                                              number_of_inequality_constraints +
+                                                                              number_of_parameters - 1)),
+                                           true));
+
         auto cost_vector_length = cost_vector.nr(),
                 cost_vector_width = cost_vector.nc();
         if (cost_vector_width != 1) {
-            throw std::runtime_error("Error: sqp_min cost function must return only 1 column.");
+            throw std::invalid_argument("sqp_min cost function must return only 1 column.");
         }
         if (cost_vector_length < number_of_inequality_constraints + 1) {
-            throw std::runtime_error(
-                    "Error: sqp_min the number of constraints in the cost function does not match the call to sqp_min.");
+            throw std::invalid_argument(
+                    "sqp_min the number of constraints in the cost function does not match the call to sqp_min.");
         }
 
         auto number_of_equality_constraints = cost_vector_length - 1 - number_of_inequality_constraints;
         auto number_of_constraints = cost_vector_length - 1;
-
-
-        /*
-        From here we assume that no approximate Hessian or
-        Lagrangian Multipliers were supplied.
-        TODO: Add support for them.
-        */
 
         double objective_function_value = cost_vector(0);
         std::vector<double> objective_function_value_history;
@@ -195,7 +183,6 @@ namespace cppsolnp {
             constraints = dlib::rowm(cost_vector, dlib::range(1, number_of_constraints));
 
             if (number_of_inequality_constraints != 0) {
-
                 if (dlib::min(
                         dlib::rowm(constraints,
                                    dlib::range(number_of_equality_constraints, number_of_constraints - 1)) -
@@ -209,8 +196,7 @@ namespace cppsolnp {
                     ) > 0.0) {
                     dlib::set_rowm(parameters, dlib::range(0, number_of_inequality_constraints - 1)) =
                             dlib::rowm(constraints,
-                                       dlib::range(number_of_equality_constraints, number_of_constraints - 1)) -
-                            dlib::rowm(parameters, dlib::range(0, number_of_inequality_constraints - 1));
+                                       dlib::range(number_of_equality_constraints, number_of_constraints - 1));
                 }
                 dlib::set_rowm(constraints, dlib::range(number_of_equality_constraints, number_of_constraints - 1)) =
                         dlib::rowm(constraints,
@@ -230,8 +216,6 @@ namespace cppsolnp {
 
         double mu = number_of_parameters;
         int iteration = 0;
-        dlib::matrix<double> hessian_matrix;
-        hessian_matrix = dlib::identity_matrix<double>(number_of_parameters + number_of_inequality_constraints);
 
         subnp<functor_model> sub_problem(
                 functor,
@@ -243,16 +227,6 @@ namespace cppsolnp {
 
         while (iteration < maximum_major_iterations) {
             ++iteration;
-            // op = [rho, minit, delta,tol,nec,nic,lagrangian_parameters_bounded]
-            // [p,l,h,mu] subnp(p,op,l,ob,pb,h,mu)
-            /* Assume hessian matrix h not supplied*/
-
-            std::string param_debug = to_string(parameters);
-            std::string param_bound_debug = to_string(parameter_bounds);
-            std::string lagr_debug = to_string(lagrangian_multipliers);
-            std::string cost_debug = to_string(cost_vector);
-            std::string hessian_debug = to_string(hessian_matrix);
-
 
             sub_problem(parameters,
                         parameter_bounds,
@@ -265,31 +239,22 @@ namespace cppsolnp {
                         delta,
                         tolerance);
 
-            param_debug = to_string(parameters);
-            param_bound_debug = to_string(parameter_bounds);
-            lagr_debug = to_string(lagrangian_multipliers);
-            cost_debug = to_string(cost_vector);
-            hessian_debug = to_string(hessian_matrix);
 
-
-            event_log->push_back("Updated parameters: " +
-                                 to_string(dlib::rowm(parameters, dlib::range(number_of_inequality_constraints,
-                                                                              number_of_inequality_constraints +
-                                                                              number_of_parameters - 1)),
-                                           true));
+            if (event_log)
+                event_log->push_back("Updated parameters: " +
+                                     to_string(dlib::rowm(parameters, dlib::range(number_of_inequality_constraints,
+                                                                                  number_of_inequality_constraints +
+                                                                                  number_of_parameters - 1)),
+                                               true));
             cost_vector = functor(dlib::rowm(parameters, dlib::range(number_of_inequality_constraints,
                                                                      number_of_inequality_constraints +
                                                                      number_of_parameters - 1))); // ob
 
             t(0) = (objective_function_value - cost_vector(0)) / (std::max(std::abs(cost_vector(0)), 1.0));
             objective_function_value = cost_vector(0);
-            std::string debug_constraints = to_string(constraints);
-            std::string debug_parameters = to_string(parameters);
 
             if (number_of_constraints != 0) {
                 constraints = dlib::rowm(cost_vector, dlib::range(1, number_of_constraints));
-                debug_constraints = to_string(constraints);
-                debug_parameters = to_string(parameters);
 
                 if (number_of_inequality_constraints != 0) {
 
@@ -313,8 +278,6 @@ namespace cppsolnp {
                             dlib::rowm(constraints,
                                        dlib::range(number_of_equality_constraints, number_of_constraints - 1)) -
                             dlib::rowm(parameters, dlib::range(0, number_of_inequality_constraints - 1));
-                    debug_constraints = to_string(constraints);
-                    debug_parameters = to_string(parameters);
                 }
                 t(2) = euclidean_norm(constraints);
 
@@ -344,28 +307,53 @@ namespace cppsolnp {
             objective_function_value_history.push_back(objective_function_value);
 
         }
-        if (number_of_inequality_constraints != 0) {
-            //		inequality_constraints = dlib::rowm(parameters, dlib::range(0,number_of_inequality_constraints-1));
-            // TODO: Output the above inequality constraints
-        }
+
         // Save result to original parameter data matrix.
         dlib::set_colm(parameter_data, 0) =
                 dlib::rowm(parameters, dlib::range(
                         number_of_inequality_constraints,
                         number_of_inequality_constraints + number_of_parameters - 1)
                 );
-        if (std::hypot(t(0), t(1)) <= tolerance) {
-            // Reached tolerance
-            event_log->push_back("Reached requested tolerance in " + std::to_string(iteration) + " iterations.");
-        } else {
-            event_log->push_back("Exiting after maximum number of iterations. Tolerance not reached.");
+
+        if (event_log) {
+            if (std::hypot(t(0), t(1)) <= tolerance) {
+                // Reached tolerance
+                event_log->push_back("Reached requested tolerance in " + std::to_string(iteration) + " iterations.");
+            } else {
+                event_log->push_back("Exiting after maximum number of iterations. Tolerance not reached.");
+            }
         }
 
-
-        std::string result_parameters = to_string(parameters);
         return objective_function_value;
     }
 
+
+    template<
+            typename functor_model,
+            typename parameter_input,
+            typename inequality_constraint_vectors>
+    double solnp(
+            functor_model functor,
+            parameter_input &parameter_data,
+            const inequality_constraint_vectors &inequality_constraint_data,
+            // Optional input
+            const cppsolnp::log_list_ptr &event_log = nullptr,
+            double rho = 1.0, //penalty parameter
+            int maximum_major_iterations = 400,
+            int maximum_minor_iterations = 800,
+            const double &delta = 1e-7, // Step size in forward difference evaluation
+            const double &tolerance = 1e-8
+    ) {
+        COMPILE_TIME_ASSERT(dlib::is_matrix<parameter_input>::value);
+        COMPILE_TIME_ASSERT(dlib::is_matrix<inequality_constraint_vectors>::value);
+        COMPILE_TIME_ASSERT(parameter_input::NC <= 3 && parameter_input::NC >= 0);
+        COMPILE_TIME_ASSERT(inequality_constraint_vectors::NC <= 3);
+
+        dlib::matrix<double> hessian_matrix = dlib::identity_matrix<double>(
+                parameter_data.nr() + inequality_constraint_data.nr());
+        return solnp(functor, parameter_data, inequality_constraint_data, hessian_matrix, event_log, rho,
+                     maximum_major_iterations, maximum_minor_iterations, delta, tolerance);
+    }
 
 }; //namespace dccgarch
 
